@@ -2,12 +2,15 @@ package treesitter
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/gofrs/uuid"
+	"github.com/uber/scip-lsp/src/ulsp/controller/diagnostics"
 	ulspplugin "github.com/uber/scip-lsp/src/ulsp/entity/ulsp-plugin"
 	"github.com/uber/scip-lsp/src/ulsp/repository/session"
 	"go.lsp.dev/protocol"
+	"go.lsp.dev/uri"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 )
@@ -31,23 +34,26 @@ type parseTreeStore map[uuid.UUID]map[protocol.DocumentURI]*ParseTree
 type Params struct {
 	fx.In
 
-	Logger   *zap.SugaredLogger
-	Sessions session.Repository
+	Logger      *zap.SugaredLogger
+	Sessions    session.Repository
+	Diagnostics diagnostics.Controller
 }
 
 type controller struct {
-	logger     *zap.SugaredLogger
-	sessions   session.Repository
-	parseTrees parseTreeStore
-	mu         sync.RWMutex
+	logger      *zap.SugaredLogger
+	sessions    session.Repository
+	diagnostics diagnostics.Controller
+	parseTrees  parseTreeStore
+	mu          sync.RWMutex
 }
 
 // New creates a new tree-sitter controller.
 func New(p Params) Controller {
 	return &controller{
-		logger:     p.Logger.With("plugin", _nameKey),
-		sessions:   p.Sessions,
-		parseTrees: make(parseTreeStore),
+		logger:      p.Logger.With("plugin", _nameKey),
+		sessions:    p.Sessions,
+		diagnostics: p.Diagnostics,
+		parseTrees:  make(parseTreeStore),
 	}
 }
 
@@ -91,61 +97,77 @@ func (c *controller) initialize(ctx context.Context, params *protocol.Initialize
 	return nil
 }
 
-// didOpen parses a newly opened document.
+// didOpen parses a newly opened document and reports any syntax diagnostics.
 func (c *controller) didOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
 	s, err := c.sessions.GetFromContext(ctx)
 	if err != nil {
 		return err
 	}
 
-	tree := c.parse(params.TextDocument.URI, params.TextDocument.Text)
+	docURI := params.TextDocument.URI
+	tree := c.parse(docURI, params.TextDocument.Text)
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.parseTrees[s.UUID] == nil {
-		return nil
+	if c.parseTrees[s.UUID] != nil {
+		c.parseTrees[s.UUID][docURI] = tree
 	}
-	c.parseTrees[s.UUID][params.TextDocument.URI] = tree
-	c.logger.Debugw("parsed document", "uri", params.TextDocument.URI)
+	c.mu.Unlock()
+
+	diags := syntaxDiagnostics(tree)
+	if err := c.diagnostics.ApplyDiagnostics(ctx, s.WorkspaceRoot, uri.URI(docURI), diags); err != nil {
+		c.logger.Warnw("failed to publish diagnostics", "uri", docURI, "error", err)
+	}
+	c.logger.Debugw("parsed document", "uri", docURI, "diagnostics", len(diags))
 	return nil
 }
 
-// didChange re-parses a document after it has changed.
+// didChange re-parses a document after it has changed and updates diagnostics.
 func (c *controller) didChange(ctx context.Context, params *protocol.DidChangeTextDocumentParams) error {
+	if len(params.ContentChanges) == 0 {
+		return nil
+	}
+
 	s, err := c.sessions.GetFromContext(ctx)
 	if err != nil {
 		return err
 	}
 
-	if len(params.ContentChanges) == 0 {
-		return nil
-	}
-
-	// Use the last content change as the full document text.
+	docURI := params.TextDocument.URI
 	text := params.ContentChanges[len(params.ContentChanges)-1].Text
-	tree := c.parse(params.TextDocument.URI, text)
+	tree := c.parse(docURI, text)
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.parseTrees[s.UUID] == nil {
-		return nil
+	if c.parseTrees[s.UUID] != nil {
+		c.parseTrees[s.UUID][docURI] = tree
 	}
-	c.parseTrees[s.UUID][params.TextDocument.URI] = tree
-	c.logger.Debugw("re-parsed document", "uri", params.TextDocument.URI)
+	c.mu.Unlock()
+
+	diags := syntaxDiagnostics(tree)
+	if err := c.diagnostics.ApplyDiagnostics(ctx, s.WorkspaceRoot, uri.URI(docURI), diags); err != nil {
+		c.logger.Warnw("failed to publish diagnostics", "uri", docURI, "error", err)
+	}
+	c.logger.Debugw("re-parsed document", "uri", docURI, "diagnostics", len(diags))
 	return nil
 }
 
-// didClose removes the parse tree for a closed document.
+// didClose removes the parse tree for a closed document and clears its diagnostics.
 func (c *controller) didClose(ctx context.Context, params *protocol.DidCloseTextDocumentParams) error {
 	s, err := c.sessions.GetFromContext(ctx)
 	if err != nil {
 		return err
 	}
 
+	docURI := params.TextDocument.URI
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.parseTrees[s.UUID] != nil {
-		delete(c.parseTrees[s.UUID], params.TextDocument.URI)
+		delete(c.parseTrees[s.UUID], docURI)
+	}
+	c.mu.Unlock()
+
+	// Clear diagnostics for this document when it is closed.
+	if err := c.diagnostics.ApplyDiagnostics(ctx, s.WorkspaceRoot, uri.URI(docURI), nil); err != nil {
+		c.logger.Warnw("failed to clear diagnostics", "uri", docURI, "error", err)
 	}
 	return nil
 }
@@ -159,9 +181,70 @@ func (c *controller) endSession(ctx context.Context, id uuid.UUID) error {
 }
 
 // parse creates a ParseTree for the given document URI and content.
-func (c *controller) parse(uri protocol.DocumentURI, content string) *ParseTree {
-	return &ParseTree{
-		URI:     uri,
-		Content: content,
+func (c *controller) parse(docURI protocol.DocumentURI, content string) *ParseTree {
+	return &ParseTree{URI: docURI, Content: content}
+}
+
+// syntaxDiagnostics returns diagnostics for basic bracket-matching errors.
+// This acts as a placeholder for real tree-sitter parsing, which can be
+// integrated here once tree-sitter Go bindings are available.
+func syntaxDiagnostics(tree *ParseTree) []*protocol.Diagnostic {
+	return checkBrackets(tree.Content)
+}
+
+// checkBrackets scans source text for mismatched or unclosed brackets, braces, and parens.
+func checkBrackets(content string) []*protocol.Diagnostic {
+	type stackEntry struct {
+		char    rune
+		line    uint32
+		col     uint32
 	}
+
+	openers := map[rune]bool{'(': true, '[': true, '{': true}
+	pairs := map[rune]rune{')': '(', ']': '[', '}': '{'}
+
+	var stack []stackEntry
+	var diags []*protocol.Diagnostic
+	errSeverity := protocol.SeverityError
+
+	var line, col uint32
+	for _, ch := range content {
+		if ch == '\n' {
+			line++
+			col = 0
+			continue
+		}
+		if openers[ch] {
+			stack = append(stack, stackEntry{ch, line, col})
+		} else if closer, ok := pairs[ch]; ok {
+			if len(stack) == 0 || stack[len(stack)-1].char != closer {
+				diags = append(diags, &protocol.Diagnostic{
+					Range: protocol.Range{
+						Start: protocol.Position{Line: line, Character: col},
+						End:   protocol.Position{Line: line, Character: col + 1},
+					},
+					Severity: &errSeverity,
+					Source:   _nameKey,
+					Message:  fmt.Sprintf("unmatched '%c'", ch),
+				})
+			} else {
+				stack = stack[:len(stack)-1]
+			}
+		}
+		col++
+	}
+
+	for _, entry := range stack {
+		diags = append(diags, &protocol.Diagnostic{
+			Range: protocol.Range{
+				Start: protocol.Position{Line: entry.line, Character: entry.col},
+				End:   protocol.Position{Line: entry.line, Character: entry.col + 1},
+			},
+			Severity: &errSeverity,
+			Source:   _nameKey,
+			Message:  fmt.Sprintf("unclosed '%c'", entry.char),
+		})
+	}
+
+	return diags
 }

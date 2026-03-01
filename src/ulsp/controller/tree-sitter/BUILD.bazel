@@ -1,4 +1,4 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "go_default_library",
@@ -6,11 +6,30 @@ go_library(
     importpath = "github.com/uber/scip-lsp/src/ulsp/controller/tree-sitter",
     visibility = ["//visibility:public"],
     deps = [
+        "//src/ulsp/controller/diagnostics:go_default_library",
         "//src/ulsp/entity/ulsp-plugin:go_default_library",
         "//src/ulsp/repository/session:go_default_library",
         "@com_github_gofrs_uuid//:go_default_library",
         "@dev_lsp_go_protocol//:go_default_library",
+        "@dev_lsp_go_uri//:go_default_library",
         "@org_uber_go_fx//:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["tree_sitter_test.go"],
+    embed = [":go_default_library"],
+    deps = [
+        "//src/ulsp/controller/diagnostics:go_diagnostics_gomock_library",
+        "//src/ulsp/entity:go_default_library",
+        "//src/ulsp/repository/session:go_repository_gomock_library",
+        "@com_github_gofrs_uuid//:go_default_library",
+        "@com_github_stretchr_testify//assert:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@dev_lsp_go_protocol//:go_default_library",
+        "@org_uber_go_mock//gomock:go_default_library",
         "@org_uber_go_zap//:go_default_library",
     ],
 )

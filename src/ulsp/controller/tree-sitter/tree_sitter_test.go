@@ -353,7 +353,7 @@ func TestCheckBrackets(t *testing.T) {
 			for _, d := range diags {
 				assert.Equal(t, _nameKey, d.Source)
 				assert.NotNil(t, d.Severity)
-				assert.Equal(t, protocol.SeverityError, *d.Severity)
+				assert.Equal(t, protocol.DiagnosticSeverityError, d.Severity)
 			}
 		})
 	}

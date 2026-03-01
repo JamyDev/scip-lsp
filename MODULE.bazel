@@ -101,6 +101,7 @@ use_repo(
     "com_github_fsnotify_fsnotify",
     "com_github_gofrs_uuid",
     "com_github_sergi_go_diff",
+    "com_github_smacker_go_tree_sitter",
     "com_github_sourcegraph_scip",
     "com_github_stretchr_testify",
     "com_github_uber_go_tally_v4",

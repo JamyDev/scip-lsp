@@ -3,7 +3,19 @@ package treesitter
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
+
+	sitter "github.com/smacker/go-tree-sitter"
+	"github.com/smacker/go-tree-sitter/golang"
+	"github.com/smacker/go-tree-sitter/java"
+	"github.com/smacker/go-tree-sitter/javascript"
+	"github.com/smacker/go-tree-sitter/kotlin"
+	"github.com/smacker/go-tree-sitter/python"
+	"github.com/smacker/go-tree-sitter/scala"
+	tstsx "github.com/smacker/go-tree-sitter/typescript/tsx"
+	tsts "github.com/smacker/go-tree-sitter/typescript/typescript"
 
 	"github.com/gofrs/uuid"
 	"github.com/uber/scip-lsp/src/ulsp/controller/diagnostics"
@@ -17,6 +29,33 @@ import (
 
 const _nameKey = "tree-sitter"
 
+// _languageMap maps LSP language IDs to tree-sitter grammars.
+var _languageMap = map[string]*sitter.Language{
+	"go":              golang.GetLanguage(),
+	"java":            java.GetLanguage(),
+	"javascript":      javascript.GetLanguage(),
+	"javascriptreact": javascript.GetLanguage(),
+	"kotlin":          kotlin.GetLanguage(),
+	"python":          python.GetLanguage(),
+	"scala":           scala.GetLanguage(),
+	"typescript":      tsts.GetLanguage(),
+	"typescriptreact": tstsx.GetLanguage(),
+}
+
+// _extToLangID maps file extensions to LSP language IDs.
+var _extToLangID = map[string]string{
+	".go":    "go",
+	".java":  "java",
+	".js":    "javascript",
+	".jsx":   "javascriptreact",
+	".kt":    "kotlin",
+	".kts":   "kotlin",
+	".py":    "python",
+	".scala": "scala",
+	".ts":    "typescript",
+	".tsx":   "typescriptreact",
+}
+
 // Controller is the interface for the tree-sitter plugin.
 type Controller interface {
 	StartupInfo(ctx context.Context) (ulspplugin.PluginInfo, error)
@@ -24,8 +63,11 @@ type Controller interface {
 
 // ParseTree represents a parsed syntax tree for a document.
 type ParseTree struct {
-	URI     protocol.DocumentURI
-	Content string
+	URI        protocol.DocumentURI
+	Content    string
+	LanguageID string
+	// Tree is the tree-sitter parse tree. Nil for unsupported languages.
+	Tree *sitter.Tree
 }
 
 type parseTreeStore map[uuid.UUID]map[protocol.DocumentURI]*ParseTree
@@ -105,7 +147,7 @@ func (c *controller) didOpen(ctx context.Context, params *protocol.DidOpenTextDo
 	}
 
 	docURI := params.TextDocument.URI
-	tree := c.parse(docURI, params.TextDocument.Text)
+	tree := c.parse(ctx, docURI, string(params.TextDocument.LanguageID), params.TextDocument.Text)
 
 	c.mu.Lock()
 	if c.parseTrees[s.UUID] != nil {
@@ -117,7 +159,7 @@ func (c *controller) didOpen(ctx context.Context, params *protocol.DidOpenTextDo
 	if err := c.diagnostics.ApplyDiagnostics(ctx, s.WorkspaceRoot, uri.URI(docURI), diags); err != nil {
 		c.logger.Warnw("failed to publish diagnostics", "uri", docURI, "error", err)
 	}
-	c.logger.Debugw("parsed document", "uri", docURI, "diagnostics", len(diags))
+	c.logger.Debugw("parsed document", "uri", docURI, "language", tree.LanguageID, "diagnostics", len(diags))
 	return nil
 }
 
@@ -133,8 +175,17 @@ func (c *controller) didChange(ctx context.Context, params *protocol.DidChangeTe
 	}
 
 	docURI := params.TextDocument.URI
+
+	// Retrieve the language ID stored during didOpen.
+	var languageID string
+	c.mu.RLock()
+	if existing := c.parseTrees[s.UUID][docURI]; existing != nil {
+		languageID = existing.LanguageID
+	}
+	c.mu.RUnlock()
+
 	text := params.ContentChanges[len(params.ContentChanges)-1].Text
-	tree := c.parse(docURI, text)
+	tree := c.parse(ctx, docURI, languageID, text)
 
 	c.mu.Lock()
 	if c.parseTrees[s.UUID] != nil {
@@ -146,7 +197,7 @@ func (c *controller) didChange(ctx context.Context, params *protocol.DidChangeTe
 	if err := c.diagnostics.ApplyDiagnostics(ctx, s.WorkspaceRoot, uri.URI(docURI), diags); err != nil {
 		c.logger.Warnw("failed to publish diagnostics", "uri", docURI, "error", err)
 	}
-	c.logger.Debugw("re-parsed document", "uri", docURI, "diagnostics", len(diags))
+	c.logger.Debugw("re-parsed document", "uri", docURI, "language", tree.LanguageID, "diagnostics", len(diags))
 	return nil
 }
 
@@ -160,44 +211,130 @@ func (c *controller) didClose(ctx context.Context, params *protocol.DidCloseText
 	docURI := params.TextDocument.URI
 
 	c.mu.Lock()
-	if c.parseTrees[s.UUID] != nil {
-		delete(c.parseTrees[s.UUID], docURI)
-	}
+	delete(c.parseTrees[s.UUID], docURI)
 	c.mu.Unlock()
 
-	// Clear diagnostics for this document when it is closed.
 	if err := c.diagnostics.ApplyDiagnostics(ctx, s.WorkspaceRoot, uri.URI(docURI), nil); err != nil {
 		c.logger.Warnw("failed to clear diagnostics", "uri", docURI, "error", err)
 	}
 	return nil
 }
 
-// endSession cleans up all parse trees for a closed session.
-func (c *controller) endSession(ctx context.Context, id uuid.UUID) error {
+func (c *controller) endSession(_ context.Context, sessionID uuid.UUID) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.parseTrees, id)
+	delete(c.parseTrees, sessionID)
 	return nil
 }
 
-// parse creates a ParseTree for the given document URI and content.
-func (c *controller) parse(docURI protocol.DocumentURI, content string) *ParseTree {
-	return &ParseTree{URI: docURI, Content: content}
+// parse parses content using the tree-sitter grammar for the given language.
+// languageID is the LSP language identifier (e.g. "go", "java"). If empty or
+// unknown, the grammar is inferred from the file extension in docURI. Returns a
+// ParseTree whose Tree field is nil for unsupported languages, which causes
+// syntaxDiagnostics to fall back to bracket matching.
+func (c *controller) parse(ctx context.Context, docURI protocol.DocumentURI, languageID, content string) *ParseTree {
+	lang, resolvedID := resolveLanguage(languageID, docURI)
+	pt := &ParseTree{URI: docURI, Content: content, LanguageID: resolvedID}
+	if lang == nil {
+		return pt
+	}
+
+	parser := sitter.NewParser()
+	defer parser.Close()
+	parser.SetLanguage(lang)
+
+	tree, err := parser.ParseCtx(ctx, nil, []byte(content))
+	if err != nil {
+		c.logger.Warnw("tree-sitter parse failed", "uri", docURI, "error", err)
+		return pt
+	}
+	pt.Tree = tree
+	return pt
 }
 
-// syntaxDiagnostics returns diagnostics for basic bracket-matching errors.
-// This acts as a placeholder for real tree-sitter parsing, which can be
-// integrated here once tree-sitter Go bindings are available.
+// resolveLanguage returns the tree-sitter Language and the resolved language ID
+// for a given LSP language ID and document URI. Falls back to file-extension
+// detection when languageID is empty or unknown.
+func resolveLanguage(languageID string, docURI protocol.DocumentURI) (*sitter.Language, string) {
+	if lang, ok := _languageMap[languageID]; ok {
+		return lang, languageID
+	}
+	ext := strings.ToLower(filepath.Ext(string(docURI)))
+	if id, ok := _extToLangID[ext]; ok {
+		return _languageMap[id], id
+	}
+	return nil, languageID
+}
+
+// syntaxDiagnostics returns diagnostics derived from the parse tree.
+// For supported languages it walks the tree-sitter AST for ERROR/MISSING nodes.
+// For unsupported languages it falls back to basic bracket matching.
 func syntaxDiagnostics(tree *ParseTree) []*protocol.Diagnostic {
-	return checkBrackets(tree.Content)
+	if tree.Tree == nil {
+		return checkBrackets(tree.Content)
+	}
+	return collectErrors(tree.Tree.RootNode())
+}
+
+// collectErrors does a depth-first walk of the AST collecting ERROR and MISSING
+// nodes as diagnostics. Recursion stops at ERROR nodes to avoid duplicates.
+func collectErrors(root *sitter.Node) []*protocol.Diagnostic {
+	var diags []*protocol.Diagnostic
+
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil || n.IsNull() {
+			return
+		}
+		if n.IsError() {
+			diags = append(diags, &protocol.Diagnostic{
+				Range:    nodeRange(n),
+				Severity: protocol.DiagnosticSeverityError,
+				Source:   _nameKey,
+				Message:  "syntax error",
+			})
+			// Don't descend — child errors are part of this error region.
+			return
+		}
+		if n.IsMissing() {
+			diags = append(diags, &protocol.Diagnostic{
+				Range:    nodeRange(n),
+				Severity: protocol.DiagnosticSeverityError,
+				Source:   _nameKey,
+				Message:  fmt.Sprintf("missing %s", n.Type()),
+			})
+			return
+		}
+		// Only recurse into subtrees that contain errors.
+		for i := 0; i < int(n.ChildCount()); i++ {
+			child := n.Child(i)
+			if child.HasError() {
+				walk(child)
+			}
+		}
+	}
+
+	walk(root)
+	return diags
+}
+
+// nodeRange converts tree-sitter start/end points to an LSP Range.
+func nodeRange(n *sitter.Node) protocol.Range {
+	start := n.StartPoint()
+	end := n.EndPoint()
+	return protocol.Range{
+		Start: protocol.Position{Line: start.Row, Character: start.Column},
+		End:   protocol.Position{Line: end.Row, Character: end.Column},
+	}
 }
 
 // checkBrackets scans source text for mismatched or unclosed brackets, braces, and parens.
+// Used as a fallback for languages without a tree-sitter grammar.
 func checkBrackets(content string) []*protocol.Diagnostic {
 	type stackEntry struct {
-		char    rune
-		line    uint32
-		col     uint32
+		char rune
+		line uint32
+		col  uint32
 	}
 
 	openers := map[rune]bool{'(': true, '[': true, '{': true}
@@ -205,7 +342,6 @@ func checkBrackets(content string) []*protocol.Diagnostic {
 
 	var stack []stackEntry
 	var diags []*protocol.Diagnostic
-	errSeverity := protocol.SeverityError
 
 	var line, col uint32
 	for _, ch := range content {
@@ -223,7 +359,7 @@ func checkBrackets(content string) []*protocol.Diagnostic {
 						Start: protocol.Position{Line: line, Character: col},
 						End:   protocol.Position{Line: line, Character: col + 1},
 					},
-					Severity: &errSeverity,
+					Severity: protocol.DiagnosticSeverityError,
 					Source:   _nameKey,
 					Message:  fmt.Sprintf("unmatched '%c'", ch),
 				})
@@ -240,7 +376,7 @@ func checkBrackets(content string) []*protocol.Diagnostic {
 				Start: protocol.Position{Line: entry.line, Character: entry.col},
 				End:   protocol.Position{Line: entry.line, Character: entry.col + 1},
 			},
-			Severity: &errSeverity,
+			Severity: protocol.DiagnosticSeverityError,
 			Source:   _nameKey,
 			Message:  fmt.Sprintf("unclosed '%c'", entry.char),
 		})

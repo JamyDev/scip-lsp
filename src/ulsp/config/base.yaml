@@ -61,6 +61,7 @@ ulspPlugins:
   indexer: true
   scala-assist: false
   jdk: true
+  tree-sitter: true
 
 guidance:
   messages:

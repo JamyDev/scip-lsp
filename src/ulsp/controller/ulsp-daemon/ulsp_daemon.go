@@ -15,6 +15,7 @@ import (
 	quickactions "github.com/uber/scip-lsp/src/ulsp/controller/quick-actions"
 	scalaassist "github.com/uber/scip-lsp/src/ulsp/controller/scala-assist"
 	"github.com/uber/scip-lsp/src/ulsp/controller/scip"
+	treesitter "github.com/uber/scip-lsp/src/ulsp/controller/tree-sitter"
 	userguidance "github.com/uber/scip-lsp/src/ulsp/controller/user-guidance"
 	"github.com/uber/scip-lsp/src/ulsp/entity"
 	ulspplugin "github.com/uber/scip-lsp/src/ulsp/entity/ulsp-plugin"
@@ -116,6 +117,7 @@ type Params struct {
 	PluginJDK          jdk.Controller
 	PluginIndexer      indexer.Controller
 	PluginScalaAssist  scalaassist.Controller
+	PluginTreeSitter   treesitter.Controller
 }
 
 type controller struct {
@@ -150,7 +152,7 @@ func New(p Params) (Controller, error) {
 	}
 
 	// When creating a new plugin, add it as a dependency in Params, then add it to the list of available plugins here.
-	availablePlugins := []ulspplugin.Plugin{p.PluginDiagnostics, p.PluginDocSync, p.PluginQuickActions, p.PluginScip, p.PluginUserGuidance, p.PluginJDK, p.PluginIndexer, p.PluginScalaAssist}
+	availablePlugins := []ulspplugin.Plugin{p.PluginDiagnostics, p.PluginDocSync, p.PluginQuickActions, p.PluginScip, p.PluginUserGuidance, p.PluginJDK, p.PluginIndexer, p.PluginScalaAssist, p.PluginTreeSitter}
 
 	c := &controller{
 		sessions:       p.Sessions,

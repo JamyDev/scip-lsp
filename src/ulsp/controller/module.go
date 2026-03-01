@@ -8,6 +8,7 @@ import (
 	quickactions "github.com/uber/scip-lsp/src/ulsp/controller/quick-actions"
 	scalaassist "github.com/uber/scip-lsp/src/ulsp/controller/scala-assist"
 	"github.com/uber/scip-lsp/src/ulsp/controller/scip"
+	treesitter "github.com/uber/scip-lsp/src/ulsp/controller/tree-sitter"
 	ulspdaemon "github.com/uber/scip-lsp/src/ulsp/controller/ulsp-daemon"
 	userguidance "github.com/uber/scip-lsp/src/ulsp/controller/user-guidance"
 	"go.uber.org/fx"
@@ -23,4 +24,5 @@ var Module = fx.Options(
 	fx.Provide(jdk.New),
 	fx.Provide(indexer.New),
 	fx.Provide(scalaassist.New),
+	fx.Provide(treesitter.New),
 )

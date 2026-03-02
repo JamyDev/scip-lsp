@@ -266,12 +266,11 @@ func resolveLanguage(languageID string, docURI protocol.DocumentURI) (*sitter.La
 	return nil, languageID
 }
 
-// syntaxDiagnostics returns diagnostics derived from the parse tree.
-// For supported languages it walks the tree-sitter AST for ERROR/MISSING nodes.
-// For unsupported languages it falls back to basic bracket matching.
+// syntaxDiagnostics walks the tree-sitter AST for ERROR/MISSING nodes.
+// Returns nil for unsupported languages (no tree available).
 func syntaxDiagnostics(tree *ParseTree) []*protocol.Diagnostic {
 	if tree.Tree == nil {
-		return checkBrackets(tree.Content)
+		return nil
 	}
 	return collectErrors(tree.Tree.RootNode())
 }
@@ -328,59 +327,3 @@ func nodeRange(n *sitter.Node) protocol.Range {
 	}
 }
 
-// checkBrackets scans source text for mismatched or unclosed brackets, braces, and parens.
-// Used as a fallback for languages without a tree-sitter grammar.
-func checkBrackets(content string) []*protocol.Diagnostic {
-	type stackEntry struct {
-		char rune
-		line uint32
-		col  uint32
-	}
-
-	openers := map[rune]bool{'(': true, '[': true, '{': true}
-	pairs := map[rune]rune{')': '(', ']': '[', '}': '{'}
-
-	var stack []stackEntry
-	var diags []*protocol.Diagnostic
-
-	var line, col uint32
-	for _, ch := range content {
-		if ch == '\n' {
-			line++
-			col = 0
-			continue
-		}
-		if openers[ch] {
-			stack = append(stack, stackEntry{ch, line, col})
-		} else if closer, ok := pairs[ch]; ok {
-			if len(stack) == 0 || stack[len(stack)-1].char != closer {
-				diags = append(diags, &protocol.Diagnostic{
-					Range: protocol.Range{
-						Start: protocol.Position{Line: line, Character: col},
-						End:   protocol.Position{Line: line, Character: col + 1},
-					},
-					Severity: protocol.DiagnosticSeverityError,
-					Source:   _nameKey,
-					Message:  fmt.Sprintf("unmatched '%c'", ch),
-				})
-			} else {
-				stack = stack[:len(stack)-1]
-			}
-		}
-		col++
-	}
-
-	for _, entry := range stack {
-		diags = append(diags, &protocol.Diagnostic{
-			Range: protocol.Range{
-				Start: protocol.Position{Line: entry.line, Character: entry.col},
-				End:   protocol.Position{Line: entry.line, Character: entry.col + 1},
-			},
-			Severity: protocol.DiagnosticSeverityError,
-			Source:   _nameKey,
-			Message:  fmt.Sprintf("unclosed '%c'", entry.char),
-		})
-	}
-
-	return diags
-}
